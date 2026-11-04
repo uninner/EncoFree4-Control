@@ -123,7 +123,7 @@ public class EncoWidgets extends AppWidgetProvider {
         WidgetSlider.apply(context,remote,g,state,position,scale);
         remote.setImageViewBitmap(R.id.widget_slider_icons,WidgetArtworkCache.image(context,g,state,scale,true));
         remote.setOnClickPendingIntent(R.id.widget_root,openPanel(context));
-        remote.setContentDescription(R.id.widget_root,"Enco Free4，点击打开控制面板");
+        remote.setContentDescription(R.id.widget_root,"Enco 耳机，点击打开控制面板");
         hit(remote,g,R.id.widget_connection,g.statusTouch,state.connected||!EncoWidgetService.allowed(context)?openPanel(context):action(context,EncoWidgetService.CONNECT),
                 state.connected?"已连接，打开连接控制":state.connecting?"连接中":"已断开，点击重新连接");
         String batteries="左耳"+batteryDescription(state.left,state.leftCharging)+"，右耳"+batteryDescription(state.right,state.rightCharging)+"，点击刷新电量";

@@ -19,7 +19,6 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.widget.Toast;
-import java.util.Locale;
 
 /** Connected-device sync. Android requires an internal FGS notice; POST_NOTIFICATIONS is not requested. */
 public final class EncoWidgetService extends Service implements EncoController.Listener {
@@ -135,10 +134,7 @@ public final class EncoWidgetService extends Service implements EncoController.L
     private boolean isTarget(BluetoothDevice device) {
         if (device == null || !allowed(this)) return false;
         try {
-            String name = device.getName();
-            if (name == null) return false;
-            String normalized = name.toLowerCase(Locale.ROOT).replace(" ", "");
-            return normalized.contains("encofree4");
+            return EncoModels.isSupported(device.getName());
         } catch (SecurityException error) { return false; }
     }
 

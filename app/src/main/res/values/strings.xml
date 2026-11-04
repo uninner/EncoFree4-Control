@@ -15,9 +15,10 @@
     <string name="battery_case">充电盒</string>
     <string name="battery_unknown">电量未读取</string>
     <string name="battery_charging">充电中</string>
-    <string name="app_name">Enco Free4 控制</string>
-    <string name="tile_label">Enco Free4</string>
-    <string name="device_name">OPPO Enco Free4</string>
+    <string name="app_name">Enco 控制</string>
+    <string name="tile_label">Enco</string>
+    <string name="device_name">OPPO Enco 耳机</string>
+    <string name="pair_hint">请先在系统蓝牙中配对并连接 Enco 耳机</string>
     <string name="connecting">正在连接…</string>
     <string name="connection_failed">连接失败</string>
     <string name="permission_needed">需要“附近的设备”权限才能控制耳机</string>
@@ -26,6 +27,7 @@
     <string name="noise_control">噪声控制</string>
     <string name="transparency">通透</string>
     <string name="noise_cancel">降噪</string>
+    <string name="adaptive">自适应</string>
     <string name="noise_off">关闭</string>
     <string name="mode_confirmation_timeout">未收到耳机的切换确认，请重试</string>
     <string name="retry">重试</string>
@@ -34,13 +36,18 @@
     <string name="settings_unavailable">无法打开设置，请从系统设置中进入</string>
     <string name="mode_switching">切换中 · %1$s</string>
     <string name="mode_current">当前 · %1$s</string>
+    <string name="mode_current_cancel">当前 · 降噪 · %1$s</string>
+    <string name="depth_1">深度降噪（实时计算）</string>
+    <string name="depth_2">中度降噪</string>
+    <string name="depth_3">轻度降噪</string>
+    <string name="depth_4">自适应</string>
     <string name="mode_reading">正在读取当前模式</string>
     <string name="mode_read_failed_tag">当前模式未读取</string>
     <string name="mode_read_failed">未读到耳机当前模式，请刷新</string>
     <string name="refresh_mode">刷新</string>
     <string name="panel_paused">面板已暂停，返回后重新连接</string>
-    <string name="widget_large_label">Enco Free4 · 2×2</string>
-    <string name="widget_compact_label">Enco Free4 · 2×1</string>
+    <string name="widget_large_label">Enco · 2×2</string>
+    <string name="widget_compact_label">Enco · 2×1</string>
     <string name="widget_large_description">耳机、电量与降噪控制，透明玻璃大卡片</string>
     <string name="widget_compact_description">电量、连接与降噪控制，透明玻璃横向卡片</string>
 </resources>

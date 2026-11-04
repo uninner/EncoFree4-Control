@@ -19,6 +19,7 @@ final class EncoProtocol {
     static final int MODE_OFF = 0;
     static final int MODE_TRANSPARENCY = 1;
     static final int MODE_ANC = 2;
+    static final int MODE_ADAPTIVE = 3;
     private static final int WIRE_MODE_OFF = 0x01;
     private static final int WIRE_MODE_ANC = 0x02;
     private static final int WIRE_MODE_TRANSPARENCY = 0x04;
@@ -27,6 +28,15 @@ final class EncoProtocol {
     }
 
     static byte[] setNoiseModeFrame(int mode, int sequence) {
+        if (mode == MODE_ADAPTIVE) {
+            // Adaptive sits at bitmap bit 12, so the mode field carries a little-endian
+            // 16-bit bitmap instead of the single-byte enum the older modes use.
+            return singleFrame(
+                    CMD_SET_NOISE_MODE,
+                    new byte[]{0x01, 0x01, 0x00, 0x10},
+                    sequence
+            );
+        }
         int mask;
         switch (mode) {
             case MODE_OFF:
@@ -162,7 +172,14 @@ final class EncoProtocol {
         return best;
     }
 
-    static int parseNoiseMode(byte[] data) {
+    /**
+     * Returns the raw noise-state bitmap carried by {@code 0x0204} or {@code 0x810C},
+     * or {@code -1} when the frame carries none.
+     *
+     * <p>Higher layers need the bitmap itself, not only the folded three-state mode,
+     * so the panel can report which cancellation step is active.
+     */
+    static int parseNoiseMask(byte[] data) {
         if (data == null || data.length < 9) {
             return -1;
         }
@@ -191,10 +208,7 @@ final class EncoProtocol {
                     mask |= (payload[index] & 0xFF) << ((index - 3) * 8);
                 }
                 if (mask != 0) {
-                    int mode = modeFromProtocolIndex(Integer.numberOfTrailingZeros(mask));
-                    if (mode >= 0) {
-                        return mode;
-                    }
+                    return mask;
                 }
             } else if (command == NOISE_MODE_RESPONSE) {
                 // Accept the response marker at the start or after one zero status byte.
@@ -212,15 +226,33 @@ final class EncoProtocol {
                         mask |= (payload[index] & 0xFF) << ((index - marker - 2) * 8);
                     }
                     if (mask != 0) {
-                        int mode = modeFromProtocolIndex(Integer.numberOfTrailingZeros(mask));
-                        if (mode >= 0) {
-                            return mode;
-                        }
+                        return mask;
                     }
                 }
             }
         }
         return -1;
+    }
+
+    static int parseNoiseMode(byte[] data) {
+        int mask = parseNoiseMask(data);
+        if (mask <= 0) {
+            return -1;
+        }
+        return modeFromMask(mask);
+    }
+
+    static int modeFromMask(int mask) {
+        if (mask <= 0) {
+            return -1;
+        }
+        return modeFromProtocolIndex(Integer.numberOfTrailingZeros(mask));
+    }
+
+    /** 1..4 for cancellation bitmap bits 4..7, otherwise {@code -1}. */
+    static int depthFromMask(int mask) {
+        int bits = mask & 0xF0;
+        return bits == 0 ? -1 : Integer.numberOfTrailingZeros(bits) - 3;
     }
 
     static EarStatus parseEarStatus(byte[] data) {
@@ -289,7 +321,13 @@ final class EncoProtocol {
             case 2:
             case 8:
                 return MODE_TRANSPARENCY;
+            case 12:
+                // Adaptive: a major mode of its own, not one of the cancellation steps.
+                return MODE_ADAPTIVE;
             default:
+                // Unknown bitmap position: do not guess between the three panel modes,
+                // so the panel keeps showing "not read" instead of a wrong mode. The
+                // raw frame is visible in the EncoProbe log for mapping a new model.
                 return -1;
         }
     }

@@ -1,6 +1,11 @@
 package io.codex.encofree4;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
@@ -131,6 +136,14 @@ public final class ControlActivity extends Activity implements EncoController.Li
     private BatteryIndicatorView batteryCase;
     private boolean bothEarbudsInCase;
     private TextView transparencyButton;
+    private TextView adaptiveButton;
+    private ImageView deviceArt;
+    private TextView earLabel;
+    private View noiseSection;
+    private View colorSwatch;
+    private boolean leftInBox, rightInBox, hasEarState, earDetailSeen;
+    private int colorIndex;
+    private int confirmedDepth = -1;
     private TextView ancButton;
     private TextView offButton;
     private TextView[] modeButtons;
@@ -264,6 +277,40 @@ public final class ControlActivity extends Activity implements EncoController.Li
             return;
         }
         renderConnection(isConnected, message);
+        if (isConnected) {
+            applyModelFeatures();
+        }
+    }
+
+    /** Hides features the connected model does not expose, and refreshes the artwork. */
+    private void applyModelFeatures() {
+        String name = currentDeviceName();
+        if (name != null) {
+            getSharedPreferences("enco_widgets", MODE_PRIVATE)
+                    .edit().putString("device_name", name).apply();
+        }
+        if (adaptiveButton != null) {
+            adaptiveButton.setVisibility(
+                    EncoModels.hasAdaptiveMode(name) ? View.VISIBLE : View.GONE);
+        }
+        if (noiseSection != null) {
+            noiseSection.setVisibility(
+                    EncoModels.hasNoiseControl(name) ? View.VISIBLE : View.GONE);
+        }
+        renderDeviceArt();
+    }
+
+    @Override
+    public void onEarDetail(boolean left, boolean right) {
+        if (!canRender() || !connected) {
+            return;
+        }
+        leftInBox = left;
+        rightInBox = right;
+        hasEarState = true;
+        earDetailSeen = true;
+        renderEarState();
+        renderDeviceArt();
     }
 
     @Override
@@ -273,6 +320,20 @@ public final class ControlActivity extends Activity implements EncoController.Li
         }
         state.mergeBattery(battery);
         renderBattery();
+        // The firmware pushes an ear/case event only when something changes, so a fresh
+        // connection leaves the state unknown. Charging is a reliable substitute: earbuds
+        // only charge while they sit in the case. A real event still wins.
+        if (!earDetailSeen && battery.count >= 2) {
+            boolean left = battery.left >= 0 && battery.leftCharging;
+            boolean right = battery.right >= 0 && battery.rightCharging;
+            if (!hasEarState || left != leftInBox || right != rightInBox) {
+                leftInBox = left;
+                rightInBox = right;
+                hasEarState = true;
+                renderEarState();
+                renderDeviceArt();
+            }
+        }
     }
 
     @Override
@@ -299,6 +360,15 @@ public final class ControlActivity extends Activity implements EncoController.Li
             hideStatus();
         }
         renderMode(state.confirmedMode);
+    }
+
+    @Override
+    public void onNoiseDepth(int depth) {
+        if (!canRender() || !connected || depth <= 0) {
+            return;
+        }
+        confirmedDepth = depth;
+        renderModeTag();
     }
 
     @Override
@@ -461,7 +531,9 @@ public final class ControlActivity extends Activity implements EncoController.Li
         content.addView(volumeCard);
 
         // Glass mode controls retain the existing three-button layout.
-        View noiseSection = createNoiseSection();
+        noiseSection = createNoiseSection();
+        noiseSection.setVisibility(
+                EncoModels.hasNoiseControl(currentDeviceName()) ? View.VISIBLE : View.GONE);
         content.addView(noiseSection);
 
         // 4. 底部杂讯清理：移除原先突兀红字，并将“更多设置”改为极简扁平化底栏
@@ -633,17 +705,116 @@ public final class ControlActivity extends Activity implements EncoController.Li
         stage.addView(ambientGlow, glowParams);
 
         // 优先使用带温润高光与细腻阴影的高清渲染图 / 精致立体矢量图
-        ImageView render = new ImageView(this);
-        render.setImageResource(R.drawable.enco_free4_device);
-        render.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        colorIndex = loadDeviceColor();
+        deviceArt = new ImageView(this);
+        deviceArt.setScaleType(ImageView.ScaleType.FIT_CENTER);
         FrameLayout.LayoutParams renderParams = new FrameLayout.LayoutParams(
                 dp(142),
                 dp(132)
         );
         renderParams.gravity = Gravity.CENTER;
-        stage.addView(render, renderParams);
+        stage.addView(deviceArt, renderParams);
+        renderDeviceArt();
+
+        earLabel = new TextView(this);
+        earLabel.setTextSize(10f);
+        earLabel.setTextColor(0x99FFFFFF);
+        FrameLayout.LayoutParams earParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        earParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        stage.addView(earLabel, earParams);
+        renderEarState();
+
+        // The headset never reports its colour, so the swatch lets the user pick it.
+        colorSwatch = new View(this);
+        FrameLayout.LayoutParams swatchParams = new FrameLayout.LayoutParams(dp(22), dp(22));
+        swatchParams.gravity = Gravity.TOP | Gravity.START;
+        swatchParams.setMargins(dp(18), dp(18), 0, 0);
+        colorSwatch.setOnClickListener(view -> cycleDeviceColor());
+        stage.addView(colorSwatch, swatchParams);
+        renderSwatch();
 
         return stage;
+    }
+
+    private void renderDeviceArt() {
+        if (deviceArt != null) {
+            deviceArt.setImageResource(EncoModels.deviceImage(
+                    currentDeviceName(), deviceColor(), bothInCase()));
+        }
+    }
+
+    private boolean bothInCase() {
+        return hasEarState && leftInBox && rightInBox;
+    }
+
+    private void renderEarState() {
+        if (earLabel == null) {
+            return;
+        }
+        earLabel.setText(hasEarState
+                ? "左耳 " + (leftInBox ? "在盒" : "佩戴") + " · 右耳 " + (rightInBox ? "在盒" : "佩戴")
+                : "");
+    }
+
+    private void renderSwatch() {
+        if (colorSwatch == null) {
+            return;
+        }
+        GradientDrawable dot = new GradientDrawable();
+        dot.setShape(GradientDrawable.OVAL);
+        dot.setColor(colorDot(deviceColor()));
+        dot.setStroke(dp(1), 0x66FFFFFF);
+        colorSwatch.setBackground(dot);
+    }
+
+    /** Swatch fill for a colour key, shared by every supported model. */
+    private int colorDot(String color) {
+        switch (color) {
+            case "purple":
+                return 0xFFB7B2C7;
+            case "pink":
+                return 0xFFF0D2CC;
+            case "grey":
+                return 0xFF4A4F55;
+            case "sea":
+                return 0xFFC7D8E8;
+            default:
+                return 0xFFF4F4F4;
+        }
+    }
+
+    private void cycleDeviceColor() {
+        String[] colors = EncoModels.colorsFor(currentDeviceName());
+        colorIndex = (colorIndex + 1) % colors.length;
+        renderDeviceArt();
+        renderSwatch();
+        getSharedPreferences("enco_widgets", MODE_PRIVATE)
+                .edit()
+                .putString("device_color", deviceColor())
+                .apply();
+        // The widget caches its decoded artwork, so drop it and refresh the widgets.
+        WidgetRenderer.invalidateDevice();
+        EncoWidgets.scheduleUpdate(this);
+    }
+
+    private String deviceColor() {
+        String[] colors = EncoModels.colorsFor(currentDeviceName());
+        return colors[Math.floorMod(colorIndex, colors.length)];
+    }
+
+    private int loadDeviceColor() {
+        String[] colors = EncoModels.colorsFor(currentDeviceName());
+        String saved = getSharedPreferences("enco_widgets", MODE_PRIVATE)
+                .getString("device_color", colors[0]);
+        for (int i = 0; i < colors.length; i++) {
+            if (colors[i].equals(saved)) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     private View createBatteryRow() {
@@ -794,16 +965,26 @@ public final class ControlActivity extends Activity implements EncoController.Li
                 getString(R.string.noise_cancel),
                 EncoProtocol.MODE_ANC
         );
+        adaptiveButton = noiseButton(
+                R.drawable.ic_anc,
+                getString(R.string.adaptive),
+                EncoProtocol.MODE_ADAPTIVE
+        );
         offButton = noiseButton(
                 R.drawable.ic_noise_off,
                 getString(R.string.noise_off),
                 EncoProtocol.MODE_OFF
         );
-        modeButtons = new TextView[]{offButton, transparencyButton, ancButton};
+        modeButtons = new TextView[]{offButton, transparencyButton, ancButton, adaptiveButton};
+        // Long press on the cancellation button walks the four cancellation steps.
+        ancButton.setOnLongClickListener(view -> cycleNoiseDepth());
 
-        selector.addView(transparencyButton, weightedButton(0));
-        selector.addView(ancButton, weightedButton(1));
-        selector.addView(offButton, weightedButton(2));
+        // Display order: cancellation, adaptive, transparency, off. Each button keeps the
+        // mode it was created with, so the order only affects placement, not behaviour.
+        selector.addView(ancButton, weightedButton(0));
+        selector.addView(adaptiveButton, weightedButton(1));
+        selector.addView(transparencyButton, weightedButton(2));
+        selector.addView(offButton, weightedButton(3));
         section.addView(selector, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(82)
@@ -876,6 +1057,8 @@ public final class ControlActivity extends Activity implements EncoController.Li
         button.setGravity(Gravity.CENTER);
         button.setCompoundDrawablePadding(dp(6));
         button.setPadding(dp(6), dp(12), dp(6), dp(12));
+        // Keep the long-press for step cycling instead of the system text picker.
+        button.setTextIsSelectable(false);
         setButtonIcon(button, iconRes, COLOR_CAPSULE_UNSELECTED_FG);
         button.setOnClickListener(view -> requestNoiseMode(mode));
         return button;
@@ -899,6 +1082,80 @@ public final class ControlActivity extends Activity implements EncoController.Li
         mainHandler.postDelayed(modeTimeoutTask, MODE_CONFIRM_TIMEOUT_MS);
     }
 
+    /** Long-press handler on the cancellation button: walks the four cancellation steps. */
+    /**
+     * Name of the bonded earbud, used to pick the matching artwork. Returns null when no
+     * supported model is bonded, in which case the generic drawing is kept.
+     */
+    @SuppressLint("MissingPermission")
+    private String currentDeviceName() {
+        try {
+            BluetoothManager manager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
+            BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
+            if (adapter == null) {
+                return null;
+            }
+            // Prefer the connected model; several Enco models may be bonded at once.
+            try {
+                int[] profiles = {BluetoothProfile.A2DP, BluetoothProfile.HEADSET};
+                for (int profile : profiles) {
+                    for (BluetoothDevice device : manager.getConnectedDevices(profile)) {
+                        String name = device.getName();
+                        if (EncoModels.isSupported(name)) {
+                            return name;
+                        }
+                    }
+                }
+            } catch (RuntimeException ignored) {
+                // Host-side tests expose no Bluetooth profile support; use the bonded list.
+            }
+            for (BluetoothDevice device : adapter.getBondedDevices()) {
+                String name = device.getName();
+                if (EncoModels.isSupported(name)) {
+                    return name;
+                }
+            }
+        } catch (SecurityException ignored) {
+            // Without the permission the panel keeps the generic artwork.
+        }
+        return null;
+    }
+
+    private boolean cycleNoiseDepth() {
+        if (!canRender() || !connected || controller == null) {
+            return true;
+        }
+        // Step from the step the earbud actually reports, so the first long press always
+        // moves one step instead of repeating the current one.
+        int next = confirmedDepth >= 1 && confirmedDepth < 4 ? confirmedDepth + 1 : 1;
+        if (controller.setNoiseDepth(next)) {
+            Toast.makeText(this, depthLabel(next), Toast.LENGTH_SHORT).show();
+        }
+        return true;
+    }
+
+    /**
+     * Names for the four cancellation steps, in ascending bitmap order.
+     *
+     * <p>Calibrated on Enco X4 firmware 116.116.100 by selecting each step in the
+     * vendor app on a second phone and reading the bitmap back, so these are the
+     * vendor's own labels rather than inferred ones.
+     */
+    private String depthLabel(int depth) {
+        switch (depth) {
+            case 1:
+                return getString(R.string.depth_1);
+            case 2:
+                return getString(R.string.depth_2);
+            case 3:
+                return getString(R.string.depth_3);
+            case 4:
+                return getString(R.string.depth_4);
+            default:
+                return "";
+        }
+    }
+
     private void renderMode(int mode) {
         if (modeButtons == null) {
             return;
@@ -906,11 +1163,13 @@ public final class ControlActivity extends Activity implements EncoController.Li
         int[] values = {
                 EncoProtocol.MODE_OFF,
                 EncoProtocol.MODE_TRANSPARENCY,
-                EncoProtocol.MODE_ANC
+                EncoProtocol.MODE_ANC,
+                EncoProtocol.MODE_ADAPTIVE
         };
         int[] icons = {
                 R.drawable.ic_noise_off,
                 R.drawable.ic_transparency,
+                R.drawable.ic_anc,
                 R.drawable.ic_anc
         };
         renderModeTag();
@@ -955,7 +1214,10 @@ public final class ControlActivity extends Activity implements EncoController.Li
                         ? R.string.mode_switch_retry_tag : R.string.mode_read_retry_tag);
                 break;
             case CURRENT:
-                noiseModeSummary.setText(getString(R.string.mode_current, modeName(state.confirmedMode)));
+                noiseModeSummary.setText(
+                        state.confirmedMode == EncoProtocol.MODE_ANC && confirmedDepth > 0
+                                ? getString(R.string.mode_current_cancel, depthLabel(confirmedDepth))
+                                : getString(R.string.mode_current, modeName(state.confirmedMode)));
                 break;
             case READ_FAILED:
                 noiseModeSummary.setText(R.string.mode_read_failed_tag);
@@ -1123,6 +1385,8 @@ public final class ControlActivity extends Activity implements EncoController.Li
                 return getString(R.string.transparency);
             case EncoProtocol.MODE_ANC:
                 return getString(R.string.noise_cancel);
+            case EncoProtocol.MODE_ADAPTIVE:
+                return getString(R.string.adaptive);
             default:
                 return "--";
         }
@@ -1239,7 +1503,7 @@ public final class ControlActivity extends Activity implements EncoController.Li
                 1f
         );
         int left = index == 0 ? 0 : dp(5);
-        int right = index == 2 ? 0 : dp(5);
+        int right = index == 3 ? 0 : dp(5);
         params.setMargins(left, 0, right, 0);
         return params;
     }

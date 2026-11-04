@@ -22,6 +22,8 @@ final class EncoSession implements EncoController.Listener {
     private final PanelState state = new PanelState(-1);
     private EncoController controller;
     private boolean connected, connecting, keepingWidgets, bothInCase, refreshing;
+    private boolean leftInBox, rightInBox;
+    private int noiseDepth = -1;
     private boolean interactive = true, pendingFromWidget;
     private String message = "已断开";
     private final Runnable modeTimeout = this::expireMode;
@@ -52,6 +54,12 @@ final class EncoSession implements EncoController.Listener {
             replay(this);
         }
         boolean setNoiseMode(int mode) { return !closed && requestMode(mode, false); }
+
+        boolean setNoiseDepth(int depth) {
+            if (closed || !connected || controller == null) return false;
+            controller.setNoiseDepth(depth);
+            return true;
+        }
         void refreshNoiseMode() { if (!closed && controller != null) controller.refreshNoiseMode(); }
         void disconnect() { if (!closed) disconnectInternal(true); }
         void pausePanel() { if (!closed && !keepingWidgets) disconnectInternal(false); }
@@ -81,6 +89,7 @@ final class EncoSession implements EncoController.Listener {
             if (state.battery != null) client.listener.onBattery(state.battery);
             client.listener.onEarStatus(bothInCase);
             if (state.confirmedMode >= 0) client.listener.onNoiseMode(state.confirmedMode);
+            if (noiseDepth > 0) client.listener.onNoiseDepth(noiseDepth);
         }
     }
 
@@ -163,6 +172,7 @@ final class EncoSession implements EncoController.Listener {
         if (!value) {
             state.disconnect();
             bothInCase = false;
+            noiseDepth = -1;
             refreshing = false;
             handler.removeCallbacks(modeTimeout);
             handler.removeCallbacks(refreshTimeout);
@@ -183,6 +193,14 @@ final class EncoSession implements EncoController.Listener {
         bothInCase = value;
         for (Client c : new ArrayList<>(clients)) if (!c.closed) c.listener.onEarStatus(value);
     }
+    @Override public void onEarDetail(boolean leftInBox, boolean rightInBox) {
+        if (!connected) return;
+        this.leftInBox = leftInBox;
+        this.rightInBox = rightInBox;
+        for (Client c : new ArrayList<>(clients)) if (!c.closed) {
+            c.listener.onEarDetail(leftInBox, rightInBox);
+        }
+    }
     @Override public void onNoiseMode(int mode) {
         if (!connected || !PanelState.validMode(mode)) return;
         state.observeMode(mode);
@@ -192,5 +210,10 @@ final class EncoSession implements EncoController.Listener {
         }
         for (Client c : new ArrayList<>(clients)) if (!c.closed) c.listener.onNoiseMode(mode);
         publishWidgets();
+    }
+    @Override public void onNoiseDepth(int depth) {
+        if (!connected || depth <= 0) return;
+        noiseDepth = depth;
+        for (Client c : new ArrayList<>(clients)) if (!c.closed) c.listener.onNoiseDepth(depth);
     }
 }

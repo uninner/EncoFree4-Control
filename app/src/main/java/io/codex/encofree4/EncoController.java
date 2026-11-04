@@ -5,6 +5,7 @@ import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothSocket;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -19,7 +20,6 @@ import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -30,10 +30,26 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 final class EncoController {
     private static final String TAG = "EncoFree4";
+
+    /**
+     * Dumps every TX/RX frame to logcat under {@link #PROBE_TAG} so a new model can be
+     * characterised with {@code adb logcat -s EncoProbe}. Frames contain commands,
+     * battery levels and mode bitmaps; they never contain Bluetooth addresses.
+     * Enabled for debug builds only.
+     */
+    static final boolean PROBE = BuildConfig.PROBE;
+    private static final String PROBE_TAG = "EncoProbe";
+    private static boolean probeSwept;
     private static final UUID SERVICE_UUID = UUID.fromString(
             "0000079A-D102-11E1-9B23-00025B00A5A5"
     );
     private static final int RFCOMM_CHANNEL = 15;
+    /** Clip advertises this placeholder UUID next to the OPPO one. */
+    private static final UUID CLIP_SERVICE_UUID =
+            UUID.fromString("99999999-9999-9999-9999-999999999999");
+    /** Standard SPP, present on every Enco model we have seen. */
+    private static final UUID STANDARD_SPP_UUID =
+            UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int MAX_AUTOMATIC_RETRIES = 2;
 
     interface Listener {
@@ -41,6 +57,17 @@ final class EncoController {
         void onBattery(EncoProtocol.Battery battery);
         void onEarStatus(boolean bothInCase);
         void onNoiseMode(int mode);
+
+        /**
+         * Called with the cancellation step (1..4) when the reported bitmap selects one.
+         * A default no-op keeps existing listeners and host-side stubs source compatible.
+         */
+        default void onNoiseDepth(int depth) {
+        }
+
+        /** Per-ear case state, so the panel can label each earbud separately. */
+        default void onEarDetail(boolean leftInBox, boolean rightInBox) {
+        }
     }
 
     private final Context context;
@@ -149,6 +176,31 @@ final class EncoController {
         }
     }
 
+    /**
+     * Selects one of the four cancellation steps the firmware exposes.
+     *
+     * <p>The wire value is the state bitmap bit itself: bits 4..7 are the four levels,
+     * while the legacy value used by {@link #setNoiseMode} enters cancellation and keeps
+     * the remembered level. An explicit level does not change the three-state result, so
+     * the panel keeps showing cancellation.
+     */
+    void setNoiseDepth(int depth) {
+        final int mask = 1 << (3 + Math.max(1, Math.min(4, depth)));
+        synchronized (stateLock) {
+            if (closed || userDisconnected || session == null) {
+                return;
+            }
+            Session target = session;
+            ioExecutor.execute(() -> runSessionTask(target, () -> {
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_SET_NOISE_MODE,
+                        new byte[]{0x01, 0x01, (byte) mask},
+                        target.nextSequence()));
+                scheduleSessionTask(target, () -> queryNoiseMode(target), 450);
+            }));
+        }
+    }
+
     void refreshNoiseMode() {
         synchronized (stateLock) {
             if (closed || userDisconnected || session == null) {
@@ -223,12 +275,53 @@ final class EncoController {
                 fail(token, "蓝牙未开启", false);
                 return;
             }
-            BluetoothDevice device = findDevice(adapter);
-            if (device == null) {
-                fail(token, "请先完成 OPPO Enco Free4 蓝牙配对", false);
+            List<BluetoothDevice> candidates = findCandidates(adapter);
+            if (candidates.isEmpty()) {
+                fail(token, context.getString(R.string.pair_hint), false);
                 return;
             }
-            BluetoothSocket newSocket = openControlSocket(device, token);
+            // Try each candidate in turn: a bonded but idle model may report as connected
+            // on a profile while its control channel is closed.
+            BluetoothDevice device = null;
+            BluetoothSocket newSocket = null;
+            Exception lastError = null;
+            String unsupported = null;
+            for (BluetoothDevice candidate : candidates) {
+                if (!isCurrent(token)) {
+                    return;
+                }
+                String candidateName = candidate.getName();
+                if (candidateName != null && !EncoModels.supportsControl(candidateName)) {
+                    // Known to expose no classic SPP channel; fail fast instead of retrying.
+                    unsupported = candidateName;
+                    continue;
+                }
+                try {
+                    newSocket = openControlSocket(candidate, token);
+                    device = candidate;
+                    break;
+                } catch (SecurityException error) {
+                    throw error;
+                } catch (Exception error) {
+                    lastError = error;
+                }
+            }
+            if (newSocket == null || device == null) {
+                if (unsupported != null) {
+                    fail(token, "该型号暂不支持控制：" + unsupported, false);
+                    return;
+                }
+                throw lastError == null ? new IOException("No control channel") : lastError;
+            }
+            // Remember the model we last talked to: widgets keep its artwork while the
+            // headset is disconnected instead of falling back to the generic drawing.
+            String model = device.getName();
+            if (model != null) {
+                context.getSharedPreferences("enco_widgets", Context.MODE_PRIVATE)
+                        .edit()
+                        .putString("device_name", model)
+                        .apply();
+            }
             Session established = new Session(token, newSocket);
             boolean accepted;
             synchronized (stateLock) {
@@ -279,7 +372,7 @@ final class EncoController {
     @SuppressLint("MissingPermission")
     private BluetoothSocket openControlSocket(BluetoothDevice device, long token) throws Exception {
         Exception lastError = null;
-        for (int attempt = 0; attempt < 4; attempt++) {
+        for (int attempt = 0; attempt < 7; attempt++) {
             if (!isCurrent(token)) {
                 throw new IOException("Connection cancelled");
             }
@@ -289,9 +382,16 @@ final class EncoController {
                     candidate = device.createRfcommSocketToServiceRecord(SERVICE_UUID);
                 } else if (attempt == 2) {
                     candidate = device.createInsecureRfcommSocketToServiceRecord(SERVICE_UUID);
-                } else {
+                } else if (attempt == 3) {
+                    candidate = device.createRfcommSocketToServiceRecord(CLIP_SERVICE_UUID);
+                } else if (attempt == 4) {
+                    candidate = device.createRfcommSocketToServiceRecord(STANDARD_SPP_UUID);
+                } else if (attempt == 5) {
                     Method createChannel = BluetoothDevice.class.getMethod("createRfcommSocket", int.class);
                     candidate = (BluetoothSocket) createChannel.invoke(device, RFCOMM_CHANNEL);
+                } else {
+                    Method createChannel = BluetoothDevice.class.getMethod("createRfcommSocket", int.class);
+                    candidate = (BluetoothSocket) createChannel.invoke(device, 3);
                 }
                 if (candidate == null) {
                     throw new IOException("No control socket");
@@ -370,24 +470,49 @@ final class EncoController {
     }
 
     @SuppressLint("MissingPermission")
-    private BluetoothDevice findDevice(BluetoothAdapter adapter) {
-        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
-        BluetoothDevice fallback = null;
-        for (BluetoothDevice device : bonded) {
-            String name = device.getName();
-            if (name == null) {
-                continue;
-            }
-            String normalized = name.trim().toLowerCase(Locale.ROOT);
-            if (normalized.contains("enco free4")) {
-                return device;
-            }
-            if (fallback == null && normalized.contains("free4")
-                    && (normalized.contains("enco") || normalized.contains("oppo"))) {
-                fallback = device;
+    private List<BluetoothDevice> findCandidates(BluetoothAdapter adapter) {
+        List<BluetoothDevice> result = new ArrayList<>();
+        // Connected models first, then everything else that is bonded.
+        BluetoothManager manager =
+                (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        if (manager != null) {
+            int[] profiles = {BluetoothProfile.A2DP, BluetoothProfile.HEADSET};
+            for (int profile : profiles) {
+                try {
+                    for (BluetoothDevice device : manager.getConnectedDevices(profile)) {
+                        String name = device.getName();
+                        if (name != null && EncoModels.isSupported(name) && !result.contains(device)) {
+                            result.add(device);
+                        }
+                    }
+                } catch (RuntimeException ignored) {
+                    // Profile unavailable on this host; fall through to the bonded list.
+                }
             }
         }
-        return fallback;
+        BluetoothDevice loose = null;
+        for (BluetoothDevice device : adapter.getBondedDevices()) {
+            String name = device.getName();
+            if (name == null || result.contains(device)) {
+                continue;
+            }
+            if (EncoModels.isSupported(name)) {
+                result.add(device);
+                continue;
+            }
+            if (loose == null) {
+                // Loose match for firmware variants that append a suffix to the model name.
+                String normalized = EncoModels.normalize(name);
+                if ((normalized.contains("free4") || normalized.contains("x4"))
+                        && (normalized.contains("enco") || normalized.contains("oppo"))) {
+                    loose = device;
+                }
+            }
+        }
+        if (loose != null) {
+            result.add(loose);
+        }
+        return result;
     }
 
     private interface IoTask {
@@ -436,6 +561,9 @@ final class EncoController {
         if (!isActive(target)) {
             throw new IOException("Session expired");
         }
+        if (PROBE) {
+            Log.d(PROBE_TAG, "TX " + hex(frame));
+        }
         // This stream belongs only to target; it can never become a later session's stream.
         target.output.write(frame);
         target.output.flush();
@@ -449,17 +577,32 @@ final class EncoController {
                     if (frame == null) {
                         break;
                     }
+                    if (PROBE) {
+                        Log.d(PROBE_TAG, "RX " + hex(frame));
+                    }
                     EncoProtocol.Battery battery = EncoProtocol.parseBattery(frame);
                     if (battery != null) {
                         postSessionCallback(target, () -> listener.onBattery(battery));
                     }
                     EncoProtocol.EarStatus earStatus = EncoProtocol.parseEarStatus(frame);
                     if (earStatus != null) {
-                        postSessionCallback(target, () -> listener.onEarStatus(earStatus.bothInCase()));
+                        final boolean leftInBox = earStatus.leftInBox;
+                        final boolean rightInBox = earStatus.rightInBox;
+                        postSessionCallback(target, () -> {
+                            listener.onEarStatus(earStatus.bothInCase());
+                            listener.onEarDetail(leftInBox, rightInBox);
+                        });
                     }
-                    int mode = EncoProtocol.parseNoiseMode(frame);
-                    if (mode >= 0) {
-                        postSessionCallback(target, () -> listener.onNoiseMode(mode));
+                    int mask = EncoProtocol.parseNoiseMask(frame);
+                    if (mask > 0) {
+                        final int mode = EncoProtocol.modeFromMask(mask);
+                        final int depth = EncoProtocol.depthFromMask(mask);
+                        if (mode >= 0) {
+                            postSessionCallback(target, () -> listener.onNoiseMode(mode));
+                            if (depth > 0) {
+                                postSessionCallback(target, () -> listener.onNoiseDepth(depth));
+                            }
+                        }
                     }
                 }
             } catch (IOException | RuntimeException ignored) {
@@ -630,5 +773,119 @@ final class EncoController {
             frame.write(current);
         }
         return frame.toByteArray();
+    }
+
+    /**
+     * Development-only, read-only sweep used to characterise an unverified model.
+     *
+     * <p>It enumerates the {@code 0x010C} sub-command selectors so that every noise-related
+     * field the firmware exposes shows up in the frame log. It runs at most once per process,
+     * and only in debug builds. The write sweep at the end briefly changes the earbud mode and
+     * restores cancellation afterwards.
+     */
+    private void probeSweep(Session target) {
+        synchronized (EncoController.class) {
+            if (probeSwept) {
+                return;
+            }
+            probeSwept = true;
+        }
+        byte[][] selectors = {
+                {0x01, 0x01}, {0x01, 0x02}, {0x01, 0x03}, {0x01, 0x04}, {0x01, 0x05},
+                {0x02, 0x01}, {0x03, 0x01}, {0x04, 0x01}, {0x05, 0x01},
+        };
+        for (byte[] selector : selectors) {
+            if (!isActive(target)) {
+                return;
+            }
+            try {
+                Log.d(PROBE_TAG, "PROBE selector " + hex(selector));
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_GET_CURRENT_NOISE_MODE,
+                        selector,
+                        target.nextSequence()));
+                Thread.sleep(200);
+            } catch (IOException error) {
+                return;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        // Write sweep: probe candidate mode values the three-state panel never sends,
+        // then read the bitmap back and finally restore cancellation.
+        int[] candidates = {0x08, 0x10, 0x20, 0x40, 0x80};
+        for (int candidate : candidates) {
+            if (!isActive(target)) {
+                return;
+            }
+            try {
+                Log.d(PROBE_TAG, "PROBE set-mode 0x" + Integer.toHexString(candidate));
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_SET_NOISE_MODE,
+                        new byte[]{0x01, 0x01, (byte) candidate},
+                        target.nextSequence()));
+                Thread.sleep(300);
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_GET_CURRENT_NOISE_MODE,
+                        new byte[]{0x01, 0x01},
+                        target.nextSequence()));
+                Thread.sleep(300);
+            } catch (IOException error) {
+                return;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        // Adaptive sits at bitmap bit 12, which does not fit a single payload byte, so its
+        // wire encoding is unknown. Probe the little-endian bitmap form and the remaining
+        // small enum values; whichever answers with bit 12 is the one to use.
+        byte[][] adaptiveCandidates = {
+                {0x01, 0x01, 0x00, 0x10},
+                {0x01, 0x01, 0x05},
+                {0x01, 0x01, 0x06},
+                {0x01, 0x01, 0x07},
+                {0x01, 0x01, 0x09},
+        };
+        for (byte[] payload : adaptiveCandidates) {
+            if (!isActive(target)) {
+                return;
+            }
+            try {
+                Log.d(PROBE_TAG, "PROBE adaptive " + hex(payload));
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_SET_NOISE_MODE,
+                        payload,
+                        target.nextSequence()));
+                Thread.sleep(300);
+                send(target, EncoProtocol.singleFrame(
+                        EncoProtocol.CMD_GET_CURRENT_NOISE_MODE,
+                        new byte[]{0x01, 0x01},
+                        target.nextSequence()));
+                Thread.sleep(300);
+            } catch (IOException error) {
+                return;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        try {
+            send(target, EncoProtocol.singleFrame(
+                    EncoProtocol.CMD_SET_NOISE_MODE,
+                    new byte[]{0x01, 0x01, 0x02},
+                    target.nextSequence()));
+        } catch (IOException ignored) {
+            // Restoring the default mode is best effort.
+        }
+    }
+
+    private static String hex(byte[] data) {
+        StringBuilder out = new StringBuilder(data.length * 3);
+        for (byte value : data) {
+            out.append(String.format("%02X ", value));
+        }
+        return out.toString().trim();
     }
 }

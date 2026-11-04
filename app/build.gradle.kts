@@ -15,8 +15,8 @@ android {
         applicationId = "io.codex.encofree4"
         minSdk = 34
         targetSdk = 34
-        versionCode = 30
-        versionName = "2.0.0"
+        versionCode = 31
+        versionName = "2.0.0-x4"
     }
 
     signingConfigs {
@@ -28,8 +28,17 @@ android {
         }
     }
 
+    buildFeatures {
+        // PROBE gates the TX/RX frame dump used to characterise a new headset model.
+        buildConfig = true
+    }
+
     buildTypes {
+        debug {
+            buildConfigField("boolean", "PROBE", "true")
+        }
         release {
+            buildConfigField("boolean", "PROBE", "false")
             isMinifyEnabled = false
             if (hasOriginalSigning) signingConfig = signingConfigs.getByName("original")
         }

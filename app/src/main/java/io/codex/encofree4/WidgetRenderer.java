@@ -18,6 +18,7 @@ import android.text.TextPaint;
 /** Native Canvas artwork sent through a supported RemoteViews ImageView, never a WebView. */
 final class WidgetRenderer {
     private static Bitmap device;
+    private static String deviceKey;
     private final Canvas canvas;
     private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final WidgetGeometry g;
@@ -26,29 +27,44 @@ final class WidgetRenderer {
     static Bitmap render(Context context, WidgetGeometry g, WidgetSnapshot state, float position, float scale) {
         return render(context,g,state,position,scale,false);
     }
+    /** Drops the cached artwork so the next render picks up a colour change. */
+    static void invalidateDevice() {
+        device = null;
+    }
+
     static Bitmap render(Context context, WidgetGeometry g, WidgetSnapshot state, float position, float scale, boolean localSlider) {
         Bitmap bitmap=Bitmap.createBitmap(Math.max(1,Math.round(g.width*scale)),Math.max(1,Math.round(g.height*scale)),Bitmap.Config.ARGB_8888);
         bitmap.setDensity(context.getResources().getDisplayMetrics().densityDpi);
         Canvas c=new Canvas(bitmap); c.scale(scale,scale);
-        if(device==null) device=BitmapFactory.decodeResource(context.getResources(),R.drawable.enco_free4_device);
-        new WidgetRenderer(c,g,state).draw(position,localSlider);
+        String artName=context.getSharedPreferences("enco_widgets",Context.MODE_PRIVATE).getString("device_name",null);
+        String artColor=context.getSharedPreferences("enco_widgets",Context.MODE_PRIVATE).getString("device_color","white");
+        // Earbuds only charge inside the case, so the charging flags tell us which
+        // artwork to draw and the key makes the cache follow that state.
+        boolean artInCase=state.leftCharging&&state.rightCharging&&state.left>=0&&state.right>=0;
+        String artKey=artName+"|"+artColor+"|"+artInCase;
+        if(device==null||!artKey.equals(deviceKey)) {
+            device=BitmapFactory.decodeResource(context.getResources(),EncoModels.deviceImage(artName,artColor,artInCase));
+            deviceKey=artKey;
+        }
+        new WidgetRenderer(c,g,state,EncoModels.hasNoiseControl(artName)).draw(position,localSlider);
         return bitmap;
     }
     static Bitmap controlIcons(Context context,WidgetGeometry g,WidgetSnapshot state,float scale) {
         Bitmap bitmap=Bitmap.createBitmap(Math.max(1,Math.round(g.track.w*scale)),Math.max(1,Math.round(g.track.h*scale)),Bitmap.Config.ARGB_8888);
         bitmap.setDensity(context.getResources().getDisplayMetrics().densityDpi);
         Canvas c=new Canvas(bitmap);c.scale(scale,scale);c.translate(-g.track.x,-g.track.y);
-        new WidgetRenderer(c,g,state).icons();
+        new WidgetRenderer(c,g,state,true).icons();
         return bitmap;
     }
     static Bitmap controlKnob(Context context,WidgetGeometry g,WidgetSnapshot state,float position,float scale) {
         Bitmap bitmap=Bitmap.createBitmap(Math.max(1,Math.round(g.track.w*scale)),Math.max(1,Math.round(g.track.h*scale)),Bitmap.Config.ARGB_8888);
         bitmap.setDensity(context.getResources().getDisplayMetrics().densityDpi);
         Canvas c=new Canvas(bitmap);c.scale(scale,scale);c.translate(-g.track.x,-g.track.y);
-        if(state.hasSelection())new WidgetRenderer(c,g,state).knob(position);
+        if(state.hasSelection())new WidgetRenderer(c,g,state,true).knob(position);
         return bitmap;
     }
-    private WidgetRenderer(Canvas canvas,WidgetGeometry g,WidgetSnapshot state) { this.canvas=canvas;this.g=g;this.state=state; }
+    private final boolean noiseControls;
+    private WidgetRenderer(Canvas canvas,WidgetGeometry g,WidgetSnapshot state,boolean noiseControls) { this.canvas=canvas;this.g=g;this.state=state;this.noiseControls=noiseControls; }
     private RectF rect(WidgetGeometry.Box b) { return new RectF(b.x,b.y,b.x+b.w,b.y+b.h); }
     private void color(int value) { paint.setShader(null);paint.setStyle(Paint.Style.FILL);paint.setColor(value);paint.setAlpha(Color.alpha(value)); }
     private void stroke(float width,int value) { color(value);paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(width); }
@@ -68,7 +84,7 @@ final class WidgetRenderer {
         paint.setShader(new LinearGradient(0,0,w,h,new int[]{0xBFFFFFFF,0x10FFFFFF,0x65FFFFFF},null,Shader.TileMode.CLAMP));
         canvas.drawRoundRect(new RectF(1.3f,1.3f,w-1.3f,h-1.3f),r-1,r-1,paint);paint.setShader(null);
         if(!g.compact) {
-            text("Enco Free4",g.title,g.titleSize,0xFFFFFFFF,false);
+            text("Enco",g.title,g.titleSize,0xFFFFFFFF,false);
             if(device!=null) {
                 float ratio=(float)device.getWidth()/device.getHeight();
                 float imageH=Math.min(g.photo.h,g.photo.w/ratio),imageW=imageH*ratio;
@@ -78,7 +94,8 @@ final class WidgetRenderer {
         }
         status();
         ring(g.left,state.left,state.leftCharging);ring(g.right,state.right,state.rightCharging);
-        control(position,localSlider);
+        // Clip has no noise control, so the slider row is left out entirely.
+        if(noiseControls) control(position,localSlider);
     }
     private void status() {
         WidgetGeometry.Box b=g.status;

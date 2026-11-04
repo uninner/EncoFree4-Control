@@ -79,6 +79,6 @@ final class PanelState {
 
     static boolean validMode(int mode) {
         return mode == EncoProtocol.MODE_OFF || mode == EncoProtocol.MODE_TRANSPARENCY
-                || mode == EncoProtocol.MODE_ANC;
+                || mode == EncoProtocol.MODE_ANC || mode == EncoProtocol.MODE_ADAPTIVE;
     }
 }
